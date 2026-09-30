@@ -1,0 +1,303 @@
+extends Node
+## Pick & Shiny mod boot loader for Eslabong (personal, offline use).
+## override.cfg registers this as the FIRST autoload, so _init() runs before any game
+## script is compiled. It then mounts patch.pck over the vanilla scripts it replaces.
+## If a game update changed those scripts, the patch is skipped (the game runs vanilla)
+## and the mod rebuilds itself in the background for the next launch.
+## To turn it off: Pick & Shiny > Uninstall (or `build.py uninstall`); install turns it back on.
+
+const MOD_VERSION: String = "@MOD_VERSION@"
+const EXPECTED_ORIGINALS: Dictionary = @EXPECTED_ORIGINALS@
+const SELFTEST_CONFIG: String = "@SELFTEST_CONFIG@"
+const SELFTEST_METHODS: Dictionary = @SELFTEST_METHODS@
+const SELFTEST_EXPECT: Dictionary = @SELFTEST_EXPECT@
+## The game's Settings autoload truncates override.cfg to a [rendering] block when the
+## renderer changes, display settings reset or the game restarts; this block is re-added.
+const OVERRIDE_BEGIN: String = "@OVERRIDE_BEGIN@"
+const OVERRIDE_BLOCK: String = @OVERRIDE_BLOCK@
+const OVERRIDE_RECHECK_DELAY_SEC: float = 5.0
+## Program (+ leading args) that rebuilds the mod: PickAndShiny.exe, or pythonw + build.py.
+const REPAIR_COMMAND: Array = @REPAIR_COMMAND@
+## The mod's own folder (work files, the `disabled` off-switch).
+const MOD_HOME: String = "@MOD_HOME@"
+const NOTICE_SECONDS: float = 20.0
+## Each build has its own pack file, so installing a new build can never change the pack a
+## running game has mounted (the engine reads mounted packs by file offset).
+const PATCH_FILE: String = "@PATCH_FILE@"
+
+var _active: bool = false
+var _problem: String = ""
+var _notice: String = ""
+
+
+func _init() -> void:
+	var self_script: Script = get_script()
+	var mod_dir: String = self_script.resource_path.get_base_dir() if self_script != null else ""
+	if mod_dir.is_empty() or not mod_dir.is_absolute_path():
+		mod_dir = OS.get_executable_path().get_base_dir().path_join("mods/PickAndShiny")
+	var log_lines: PackedStringArray = ["Pick & Shiny " + MOD_VERSION + " boot " + Time.get_datetime_string_from_system()]
+	var actual_md5: Dictionary = {}
+	for res_path in EXPECTED_ORIGINALS:
+		var actual: String = FileAccess.get_md5(res_path)
+		actual_md5[res_path] = actual
+		if actual != str(EXPECTED_ORIGINALS[res_path]):
+			_problem = "game updated (%s changed)" % res_path.get_file()
+		var source_path: String = res_path.get_basename() + ".gd"
+		if ResourceLoader.has_cached(source_path):
+			_problem = "%s was loaded before the mod (autoload order changed)" % source_path.get_file()
+		log_lines.append("%s md5=%s expected=%s" % [res_path, actual, EXPECTED_ORIGINALS[res_path]])
+	var pck_path: String = mod_dir.path_join(PATCH_FILE)
+	var user_args: PackedStringArray = OS.get_cmdline_user_args()
+	if user_args.has("--pickshiny-vanilla-sweep"):
+		# Baseline for the self-test: compile every game script WITHOUT the patch mounted.
+		log_lines.append("SWEEP-VANILLA")
+		_compile_sweep(log_lines)
+		_write_log(mod_dir, log_lines)
+		OS.kill(OS.get_process_id())
+		return
+	if _problem.is_empty():
+		if ProjectSettings.load_resource_pack(pck_path, true):
+			_active = true
+		else:
+			_problem = "could not load " + pck_path
+	log_lines.append("ACTIVE" if _active else "INACTIVE: " + _problem)
+	if user_args.has("--pickshiny-selftest"):
+		_run_self_test(log_lines)
+		_compile_sweep(log_lines)
+		_write_log(mod_dir, log_lines)
+		OS.kill(OS.get_process_id())
+		return
+	if not _active:
+		_notice = _plan_repair(mod_dir, actual_md5, log_lines)
+		push_warning("[Pick & Shiny] " + _problem)
+	_remove_stale_packs(mod_dir, log_lines)
+	_write_log(mod_dir, log_lines)
+
+
+## Packs from earlier builds (only ever read by a game session that has since ended).
+func _remove_stale_packs(mod_dir: String, log_lines: PackedStringArray) -> void:
+	for file in DirAccess.get_files_at(mod_dir):
+		if file.begins_with("patch") and file.ends_with(".pck") and file != PATCH_FILE:
+			if DirAccess.remove_absolute(mod_dir.path_join(file)) == OK:
+				log_lines.append("removed old " + file)
+
+
+## Starts `build.py auto` in the background unless this exact game version already failed.
+func _plan_repair(mod_dir: String, actual_md5: Dictionary, log_lines: PackedStringArray) -> String:
+	var status_path: String = mod_dir.path_join("status.json")
+	var status: Variant = JSON.parse_string(FileAccess.get_file_as_string(status_path)) if FileAccess.file_exists(status_path) else null
+	if status is Dictionary and not bool(status.get("ok", true)):
+		var known: Dictionary = status.get("fingerprints", {})
+		var same_version: bool = not known.is_empty()
+		for res_path in actual_md5:
+			if str(known.get(res_path, "")) != str(actual_md5[res_path]):
+				same_version = false
+		if same_version:
+			log_lines.append("repair already failed for this game version: " + str(status.get("message", "")))
+			return "Pick & Shiny is OFF - it needs an update for this game version (%s)" % str(status.get("message", ""))
+	if REPAIR_COMMAND.is_empty() or not FileAccess.file_exists(str(REPAIR_COMMAND[0])):
+		return "Pick & Shiny is OFF: %s" % _problem
+	if FileAccess.file_exists(MOD_HOME.path_join("disabled")):
+		return ""
+	# build.py records a failure against these fingerprints, so a repair that cannot succeed
+	# is not retried on every launch.
+	var request: FileAccess = FileAccess.open(mod_dir.path_join("repair_request.json"), FileAccess.WRITE)
+	if request != null:
+		request.store_string(JSON.stringify({"fingerprints": actual_md5, "problem": _problem}))
+		request.close()
+	var repair_args: PackedStringArray = []
+	for arg in REPAIR_COMMAND.slice(1):
+		repair_args.append(str(arg))
+	repair_args.append_array(["auto", "--from-boot"])
+	var pid: int = OS.create_process(str(REPAIR_COMMAND[0]), repair_args)
+	log_lines.append("started self-repair (pid %d)" % pid)
+	if pid <= 0:
+		return "Pick & Shiny is OFF: %s - run build.py install" % _problem
+	return "Game updated - Pick & Shiny is updating itself. Restart the game in about a minute."
+
+
+func _ready() -> void:
+	get_tree().create_timer(OVERRIDE_RECHECK_DELAY_SEC).timeout.connect(_ensure_override_cfg)
+	if _notice.is_empty():
+		return
+	var layer: CanvasLayer = CanvasLayer.new()
+	layer.layer = 128
+	var label: Label = Label.new()
+	label.text = _notice
+	label.add_theme_color_override("font_color", Color(1.0, 0.75, 0.3))
+	label.add_theme_color_override("font_outline_color", Color.BLACK)
+	label.add_theme_constant_override("outline_size", 6)
+	label.position = Vector2(12, 8)
+	layer.add_child(label)
+	add_child(layer)
+	get_tree().create_timer(NOTICE_SECONDS).timeout.connect(layer.queue_free)
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST or what == NOTIFICATION_EXIT_TREE:
+		_ensure_override_cfg()
+
+
+func _ensure_override_cfg() -> void:
+	# An inactive loader holds a possibly stale autoload list, and an uninstalled or disabled
+	# mod must stay removed; launch.pyw / build.py rewrite the block in those cases.
+	if OS.has_feature("editor") or not _active:
+		return
+	var self_script: Script = get_script()
+	if self_script == null or not FileAccess.file_exists(self_script.resource_path):
+		return
+	if FileAccess.file_exists(MOD_HOME.path_join("disabled")):
+		return
+	var path: String = OS.get_executable_path().get_base_dir().path_join("override.cfg")
+	var text: String = FileAccess.get_file_as_string(path) if FileAccess.file_exists(path) else ""
+	if text.contains(OVERRIDE_BEGIN):
+		return
+	var merged: String = text.strip_edges(false, true)
+	if not merged.is_empty():
+		merged += "\n\n"
+	var file: FileAccess = FileAccess.open(path, FileAccess.WRITE)
+	if file != null:
+		file.store_string(merged + OVERRIDE_BLOCK)
+
+
+func _write_log(mod_dir: String, log_lines: PackedStringArray) -> void:
+	var log_file: FileAccess = FileAccess.open(mod_dir.path_join("boot.log"), FileAccess.WRITE)
+	if log_file != null:
+		log_file.store_string("\n".join(log_lines) + "\n")
+
+
+## Compiles every game script (not only the patched ones: a patched class can break the
+## scripts that depend on it). build.py compares the result with a vanilla run.
+func _compile_sweep(log_lines: PackedStringArray) -> void:
+	var scripts: Dictionary = {}
+	var pending: Array[String] = ["res://"]
+	while not pending.is_empty():
+		var dir_path: String = pending.pop_back()
+		var dir: DirAccess = DirAccess.open(dir_path)
+		if dir == null:
+			continue
+		for sub in dir.get_directories():
+			if not sub.begins_with(".") and sub != "Tests" and sub != "Tools":
+				pending.append(dir_path.path_join(sub))
+		for file in dir.get_files():
+			if file.ends_with(".gd.remap"):
+				scripts[dir_path.path_join(file.trim_suffix(".remap"))] = true
+			elif file.ends_with(".gd"):
+				scripts[dir_path.path_join(file)] = true
+	var failed: PackedStringArray = []
+	var paths: Array = scripts.keys()
+	paths.sort()
+	for path in paths:
+		var scr: Script = load(path) as Script
+		if scr == null or not scr.can_instantiate():
+			failed.append(path)
+	log_lines.append("SWEEP compiled %d scripts, %d failed" % [paths.size(), failed.size()])
+	for path in failed:
+		log_lines.append("SWEEP-FAIL " + path)
+
+
+## Headless check used by build.py: compiles every patched script, confirms the patched
+## versions are the ones the engine resolves, and measures the shiny rates.
+func _run_self_test(log_lines: PackedStringArray) -> void:
+	var passed: bool = _active
+	for script_path in SELFTEST_METHODS:
+		var scr: Script = load(script_path)
+		var compiled: bool = scr != null and scr.can_instantiate()
+		var missing: PackedStringArray = []
+		if compiled:
+			var names: Dictionary = {}
+			for method in scr.get_script_method_list():
+				names[method.name] = true
+			for wanted in SELFTEST_METHODS[script_path]:
+				if not names.has(wanted):
+					missing.append(wanted)
+		passed = passed and compiled and missing.is_empty()
+		log_lines.append("SELFTEST compile %s -> %s%s" % [script_path, "OK" if compiled else "FAILED", "" if missing.is_empty() else " missing " + ", ".join(missing)])
+	var mercenary_script: Script = load("res://Scripts/Campaign/MercenaryInstance.gd")
+	var staff_script: Script = load("res://Scripts/Staff/StaffService.gd")
+	var config: Resource = load(SELFTEST_CONFIG)
+	if mercenary_script == null or not mercenary_script.can_instantiate() or staff_script == null or config == null:
+		log_lines.append("SELFTEST RESULT FAIL (could not load scripts or " + SELFTEST_CONFIG + ")")
+		return
+	var constants: Dictionary = mercenary_script.get_script_constant_map()
+	var ai_denominator: int = int(constants.get("SHINY_ROLL_DENOMINATOR", -1))
+	var player_denominator: int = int(constants.get("PLAYER_SHINY_ROLL_DENOMINATOR", ai_denominator))
+	var player_shiny: bool = bool(SELFTEST_EXPECT.get("player_shiny", false))
+	var expected_player: int = int(SELFTEST_EXPECT.get("player_denominator", ai_denominator)) if player_shiny else ai_denominator
+	var recruit_denominator: int = expected_player if bool(SELFTEST_EXPECT.get("recruit_odds", false)) else ai_denominator
+	log_lines.append("SELFTEST SHINY_ROLL_DENOMINATOR=%d (AI/vanilla) PLAYER_SHINY_ROLL_DENOMINATOR=%d" % [ai_denominator, player_denominator])
+	passed = passed and ai_denominator == 5000 and player_denominator == expected_player
+	var rolls: int = 50000
+	var rng: RandomNumberGenerator = RandomNumberGenerator.new()
+	rng.seed = 12345
+	var ai_hits: int = 0
+	var recruit_hits: int = 0
+	var starter_hits: int = 0
+	seed(12345)
+	for i in rolls:
+		if mercenary_script.call("roll_shiny", config, rng):
+			ai_hits += 1
+		if staff_script.call("roll_fighter_shiny", null, config, rng):
+			recruit_hits += 1
+		if player_shiny and mercenary_script.call("roll_player_shiny_flag"):
+			starter_hits += 1
+	var checks: Array = [["AI/league/enemy roll_shiny", ai_hits, ai_denominator], ["player recruits (StaffService)", recruit_hits, recruit_denominator]]
+	if player_shiny:
+		checks.append(["player starters", starter_hits, expected_player])
+	for entry in checks:
+		var expected_hits: float = float(rolls) / float(entry[2])
+		var low: float = 2.0 if entry[2] >= 1000 else expected_hits * 0.85
+		var high: float = 25.0 if entry[2] >= 1000 else expected_hits * 1.15
+		var ok: bool = float(entry[1]) >= low and float(entry[1]) <= high
+		passed = passed and ok
+		log_lines.append("SELFTEST %s: %d / %d = 1 in %.1f (expected 1 in %d) %s" % [entry[0], entry[1], rolls, float(rolls) / maxf(1.0, float(entry[1])), entry[2], "OK" if ok else "OUT OF RANGE"])
+	if bool(SELFTEST_EXPECT.get("champion_trio", false)):
+		passed = _self_test_champion_trio(log_lines) and passed
+	log_lines.append("SELFTEST RESULT " + ("PASS" if passed else "FAIL"))
+
+
+## Runs the real (patched) starter-commit sanitizer and the founding screen's trio restore.
+func _self_test_champion_trio(log_lines: PackedStringArray) -> bool:
+	var champions: Array = SELFTEST_EXPECT.get("champions", [])
+	var troop: String = SELFTEST_CONFIG
+	var service_script: Script = load("res://Scripts/Campaign/CampaignService.gd")
+	var screen_script: Script = load("res://Scenes/Campaign/TeamFoundingScreen.gd")
+	if champions.size() < 3 or service_script == null or screen_script == null:
+		log_lines.append("SELFTEST champion trio: missing scripts or champion configs")
+		return false
+	for path in champions:
+		if not ResourceLoader.exists(path):
+			log_lines.append("SELFTEST champion trio: %s not in this game version" % path)
+			return false
+	var c1: String = champions[0]
+	var c2: String = champions[1]
+	var c3: String = champions[2]
+	var service: Object = service_script.new()
+	var ok: bool = true
+	var cases: Array = [
+		["3 distinct champions", [c1, c2, c3], 3],
+		["duplicate champion rejected", [c1, c1, c2], 2],
+		["vanilla 1 champion + 2 fighters", [c1, troop, troop], 3],
+		["champion must lead", [troop, c1, c2], 2],
+	]
+	for case in cases:
+		var result: Dictionary = service.call("_sanitize_skipped_intro_starter_configs_with_variants", case[1], ["", "", ""], true, [], "champion_start")
+		var kept: int = (result.get("configs", []) as Array).size()
+		var case_ok: bool = kept == int(case[2])
+		ok = ok and case_ok
+		log_lines.append("SELFTEST commit check, %s: kept %d (expected %d) %s" % [case[0], kept, case[2], "OK" if case_ok else "WRONG"])
+	service.free()
+	var screen: Object = screen_script.new()
+	var restores: Array = [
+		["trio", [c1, c2, c3], [c1, c2, c3]],
+		["mixed 2 champions + fighter", [c1, c2, troop], [c1, c2, troop]],
+		["old 1 champion + 2 fighters", [c1, troop, troop], [c1, troop, troop]],
+		["duplicate and leading fighter skipped", [troop, c2, c2, c1, troop], [c2, c1, troop]],
+	]
+	for case in restores:
+		var restored: Array = screen.call("_ps_sanitize_champion_trio", case[1])
+		var restore_ok: bool = restored == case[2]
+		ok = ok and restore_ok
+		log_lines.append("SELFTEST founding screen restore, %s: %s" % [case[0], "OK" if restore_ok else "WRONG " + str(restored)])
+	screen.free()
+	return ok

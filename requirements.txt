@@ -1,0 +1,2 @@
+pycryptodome>=3.20   # AES for reading the game's pack directory
+pyinstaller>=6.10    # only to build PickAndShiny.exe (installer/make_installer.py)

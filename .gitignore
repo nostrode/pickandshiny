@@ -1,0 +1,21 @@
+# Never commit anything taken from the game, the recovered key, saves or build output.
+src_current/
+current/
+old_sep13/
+work/
+dist/
+selftest/
+needs_update/
+save_backup*/
+gdre/
+tools/pylib/
+installer/build/
+installer/pydeps/
+installer/*.zip
+*.pck
+*.gdc
+key.txt
+disabled
+auto.log*
+*.log
+__pycache__/
